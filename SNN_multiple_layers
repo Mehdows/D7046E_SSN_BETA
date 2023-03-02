@@ -1,0 +1,350 @@
+%matplotlib inline
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from __future__ import print_function   # Python 2.X support for print function, not needed in Python 3.X
+from IPython.display import clear_output
+#from IPython.core.debugger import set_trace # Activates debugging features
+
+def rasterplot(ax, x, y, x_label, y_label):
+# Function used to plot spike times
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.scatter(x, y, marker='|')
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+
+def lif_neuron(I_inject, E_L=-65e-3, u_reset=-65e-3, u_thres=-50e-3, R=90e6, tau_m=30e-3):
+    # LIF neuron with a constant injection current
+    return {
+        'type'    : 'lif',
+        'u'       : u_reset,                   # Membrane potential [Volt]
+        'E_L'     : E_L,                       # Leakage resting potential [Volt]
+        'u_reset' : u_reset,                   # Reset potential after spike [Volt]
+        'u_thres' : u_thres,                   # Threshold for spike generation [Volt]
+        'R'       : R,                         # Membrane resistance [Ohm]
+        'tau_m'   : tau_m,                     # Membrane time constant [second]
+        'I_inj'   : I_inject,                  # Injection current [Ampere]
+    }
+
+def lif_syn_neuron(num_synapses, E_L=-65e-3, u_reset=-65e-3, u_thres=-50e-3, R=90e6, tau_m=30e-3, I_inject=0, tau_syn=50e-3):
+    # LIF neuron with dynamic synapses
+    n = lif_neuron(I_inject, E_L, u_reset, u_thres, R, tau_m)
+    n['tau_syn'] = tau_syn                     # Synapse time constant [second] (can also be an array)
+    n['I_syn']   = np.zeros(num_synapses)      # Postsynaptic currents [Ampere]
+    n['w_syn']   = np.zeros(num_synapses)      # Synaptic weights [Ampere]
+    n['type']    = 'lif_syn'
+    return n
+
+def lif_stdp_neuron(num_synapses, E_L=-65e-3, u_reset=-65e-3, u_thres=-50e-3, R=90e6, tau_m=30e-3, I_inject=0,
+                    tau_syn=50e-3, tau_pls=20e-3, tau_mns=20e-3, w_max=1e-9, w_min=1e-12, gamma=1):
+    # LIF neuron with dynamic synapses and pair-based STDP
+    n = lif_syn_neuron(num_synapses, E_L, u_reset, u_thres, R, tau_m, I_inject, tau_syn)
+    n['x_pre']   = np.zeros(num_synapses)      # STDP trace of presynaptic spikes
+    n['y_pst']   = 0                           # STDP trace of postsynaptic spikes (scalar, one neuron)
+    n['tau_pls'] = tau_pls                     # STDP trace time constant [second] (can also be an array)
+    n['tau_mns'] = tau_mns                     # STDP trace time constant [second] (can also be an array)
+    n['w_max']   = w_max                       # Largest allowed value of synapse conductance
+    n['w_min']   = w_min                       # Lowest allowed value of synapse conductance
+    n['gamma']   = gamma                       # Learning rate parameter with soft bounds (w_min,w_max)
+    n['type']    = 'lif_stdp'
+    return n
+
+def integrate(dt, t, neurons):
+    # Integrate the membrane potential, postsynaptic currents etc one timestep dt
+    for n in neurons:
+        if n['type'] == 'lif':
+            # Integrate membrane potential
+            dudt = (n['E_L'] - n['u'] + n['R']*n['I_inj']) / n['tau_m']
+            n['u'] += dt*dudt
+        elif n['type'] in ['lif_syn','lif_stdp']:
+            # Integrate array of postsynaptic currents, one current for each synapse
+            didt = np.divide(-n['I_syn'], n['tau_syn'])
+            n['I_syn'] += dt*didt
+            # Integrate membrane potential
+            dudt = (n['E_L'] - n['u'] + n['R']*(n['I_inj']+sum(n['I_syn']))) / n['tau_m']
+            n['u'] += dt*dudt
+            # Integrate local traces for pair-based plasticity
+            if n['type'] == 'lif_stdp':
+                n['x_pre'] -= dt*np.divide(n['x_pre'], n['tau_pls'])       # Eq 19.12
+                n['y_pst'] -= dt*np.divide(n['y_pst'], n['tau_mns'])       # Eq 19.13
+            
+def spikegen(dt, t, neurons):
+    # Implements the non-linear spike generation mechanism
+    spikes = []
+    for i,n in enumerate(neurons):
+        if n['type'] in ['lif','lif_syn','lif_stdp']:
+            if n['u'] > n['u_thres']:
+                n['u'] = n['u_reset']
+                spikes.append(i)
+        elif n['type'] == 'poisson':
+            if np.random.rand() < dt*n['frequency']:
+                spikes.append(i)
+        elif n['type'] == 'generator':
+            j = np.searchsorted(n['spike_t'], t, side='right')
+            if j>0 and t-n['spike_t'][j-1]<dt:
+                spikes.append(i)
+                
+    return spikes
+
+def update(dt, t, neurons, connections):
+    # Update the state of a spiking neural network.
+    # Refer to Exercise 3 for a reminder about how to set up connections between neurons.
+    integrate(dt, t, neurons)
+    spikes = spikegen(dt, t, neurons)
+
+    # Update weights and STDP trace for each postsynaptic spike
+    for spike in spikes:
+        n = neurons[spike]
+        if n['type'] in ['lif_stdp']:
+            n['y_pst'] += 1                                         # Eq 19.13
+            for i,w in enumerate(n['w_syn']):
+                if w > 0:                                           # Excitatory synapses
+                    Aplus = n['gamma']*(n['w_max'] - n['w_syn'][i]) # Eq 19.4
+                    n['w_syn'][i] += dt*Aplus*n['x_pre'][i]         # Eq 19.14
+    
+    # Update synapse currents, weights and STDP traces for each presynaptic spike
+    for (post, syn, pre) in connections:
+        for spike in spikes:
+            if spike == pre:
+                n = neurons[post]
+                
+                if n['type'] not in ['lif_syn', 'lif_stdp']:
+                    print('Error: Spike sent to neuron type without synapses')
+                
+                # Update synapse currents
+                if n['type'] in ['lif_syn','lif_stdp']:
+                    n['I_syn'][syn] += n['w_syn'][syn]
+                    
+                # Update STDP trace and weight
+                if n['type'] in ['lif_stdp']:
+                    n['x_pre'][syn] += 1                                   # Eq 19.12
+                    if n['w_syn'][syn] > 0:                                # Excitatory synapses
+                        Aminus = n['gamma']*(n['w_min'] - n['w_syn'][syn]) # Eq 19.4
+                        n['w_syn'][syn] += dt*Aminus*n['y_pst']            # Eq 19.14
+    
+    return spikes
+
+def set_input_frequencies(neurons, image):
+# Convert pixel intensities to spikerates of random (Poisson) neurons
+    for i in range(N_pixls):
+        for j in range(N_pixls):
+            neurons[i*N_pixls+j]['frequency'] = 5 + 55*image[i][j] # 5-60 Hz
+
+def reset_input_frequencies(neurons):
+# Reset frequencies of input neurons to 0 Hz
+    for i in range(N_pixls):
+        for j in range(N_pixls):
+            neurons[i*N_pixls+j]['frequency'] = 0
+            
+def plot_digit(plt, data):
+# Display MNIST images
+    data = data.view(28,28)
+    plt.imshow(data, cmap='gray')
+
+    
+def spikerate_filter(spikerate, spikecount, simtime, alpha):
+# Low-pass filter for estimation of spikerate
+    if spikerate > 0:
+        spikerate = alpha*spikerate + (1-alpha)*spikecount/simtime
+    else:
+        spikerate = spikecount/simtime
+    return spikerate
+
+
+def plot_neuron_weights(n):
+# Plot the input weights of an excitatory neuron (with STDP synapses)
+    plt.rcParams['figure.figsize'] = [10, 3]
+    fig,(ax1,ax2) = plt.subplots(1,2)
+    img = np.zeros((N_pixls,N_pixls))
+    for i in range(N_pixls):
+        for j in range(N_pixls):
+            img[i][j] = n['w_syn'][i*N_pixls+j]/1e-12
+    ax1.imshow(img, cmap='viridis')
+    ax2.hist(np.hstack(img))
+    ax2.set_xlabel('Weight [pA]')
+    ax2.set_ylabel('No. synapses')
+    plt.show()
+
+# Extract 10 training samples for two classes of digits
+
+rightVid = loadDataset("right")
+leftVid = loadDataset("left")
+
+
+
+
+def poisson_neuron(spike_frequency):
+    # Random spike generator with Poisson distributed spike time intervals, see Section 7.2.1 in the book
+    return {
+        'type'      : 'poisson',
+        'frequency' : spike_frequency          # Average spiking frequency
+    }
+
+N_pixls = 6
+#N_input = N_pixls*N_pixls
+N_input = 784
+N_inhibit = 36
+N_middle = 36
+
+neurons = []
+connections = []
+
+# Create input neurons, frequencies will be set later
+for i in range(N_input):
+    neurons.append(poisson_neuron(0))
+for i in range(N_middle):
+    neurons.append(lif_stdp_neuron(N_input+N_inhibit, w_min=-10e-12, w_max=10e-12,u_reset=-65e-3, u_thres=-10e-3))
+
+for i in range(N_inhibit):
+    neurons.append(lif_stdp_neuron(N_input))
+
+#connection loop, N_input to N_middle
+for j in range(N_middle):
+    for i in range(N_input):
+    #connect N_input to N_middle
+        connections.append([N_input+j,i,i])
+
+#connection loop, N_inhibit to N_middle
+for j in range(N_middle):
+    for i in range(N_inhibit):
+        connections.append([N_input+j,N_input+i,N_input+N_middle+i])
+#connection loop, N_input to N_inhibit
+for j in range(N_inhibit):
+    for i in range(N_input):
+        connections.append([N_input+N_middle+j,i,i])
+
+#set random weight loop
+for i in range(N_inhibit):
+    e_inhib = neurons[N_input+N_middle+i]
+    e_middle = neurons[N_input+i]
+    for j in range(N_input):
+        
+        e_inhib['w_syn'][j] = 2e-10*(0.1 + 0.9*np.random.rand())
+        e_middle['w_syn'][j] = 2e-10*(0.1 + 0.9*np.random.rand())
+
+        neurons[N_input+N_middle+i] = e_inhib
+        neurons[N_input+i] = e_middle
+#random weight inhib to middle
+
+for j in range(N_middle):
+    e_middle = neurons[N_input+j]
+    e_middle['w_syn'][N_input+j] = -2e-10*(0.1 + 0.9*np.random.rand())
+    neurons[N_input+j] = e_middle
+
+
+    
+# Create two excitatory neurons
+e1 = lif_stdp_neuron(N_middle + 1, w_min=0, w_max=10e-12)
+e2 = lif_stdp_neuron(N_middle + 1, w_min=0, w_max=10e-12)
+neurons.append(e1)
+neurons.append(e2)
+I_e1 = N_input+N_middle+N_inhibit
+I_e2 = N_input+N_middle+N_inhibit+1
+
+#connection loop, N_middle to N_output
+# Define excitatory STDP synapses for the inputs
+for j in range(N_middle):
+    e1['w_syn'][j] = 2e-10*(0.1 + 0.9*np.random.rand())
+    e2['w_syn'][j] = 2e-10*(0.1 + 0.9*np.random.rand())
+    
+    connections.append([I_e1,j,N_input+j]) # [post,syn,pre], see Exercise 3 for details
+    connections.append([I_e2,j,N_input+j]) # [post,syn,pre]
+
+# Lateral inhibition (neglecting Dale's law to simplify the exercise)
+I_inhib = N_middle
+e1['w_syn'][I_inhib] = -1e-12
+e2['w_syn'][I_inhib] = -1e-12
+connections.append([I_e1,I_inhib,I_e2])
+connections.append([I_e2,I_inhib,I_e1])
+
+# Reset the simulation time
+t = 0
+dt = 5e-4
+simtime = 0.267
+rsttime = 0.15
+
+# Reset spikerate variables
+e1_spikerate = -1
+e2_spikerate = -1
+
+# Speed up learning a bit
+e1['gamma'] = 5
+e2['gamma'] = 5
+
+
+
+
+for iterations in range(40): # Training iterations
+
+    # Start time
+    t0 = t
+    
+    # Spike counts of e1 and e2
+    e1_count = 0
+    e2_count = 0
+    
+    # Sample a different digit every second iteration
+    stimuli = []
+    if iterations % 2 == 0:
+        
+        vid = rightVid[int(len(rightVid)*np.random.rand())]
+        ##############################################################################
+        #INSERT SUPERVISION SIGNAL HERE, INHIBIT ONE OF THE TWO STDP NEURONS
+        e1['w_syn'][I_inhib] = -200e-12
+        e2['w_syn'][I_inhib] = 0
+        ##############################################################################
+    else:
+        vid = leftVid[int(len(leftVid)*np.random.rand())]
+        ##############################################################################
+        # INSERT SUPERVISION SIGNAL HERE, INHIBIT ONE OF THE TWO STDP NEURONS
+        e1['w_syn'][I_inhib] = 0
+        e2['w_syn'][I_inhib] = -200e-12
+        ##############################################################################
+    
+    stimuli = vid[0][0]
+    frameCount = 1
+    set_input_frequencies(neurons, stimuli)
+    
+    # Simulate the network
+    while t < t0+simtime:
+        
+        if t-t0 > 1/60*frameCount and frameCount != len(vid):
+            stimuli = vid[frameCount][0]
+            set_input_frequencies(neurons, stimuli)
+            frameCount += 1
+        
+        
+        # Update network, including STDP
+        spikes = update(dt, t, neurons, connections)
+        
+        # Count number of spikes from e1 and e2
+        e1_count += spikes.count(I_e1)
+        e2_count += spikes.count(I_e2)
+        
+        # Timestep completed
+        t += dt
+        print('\r t = %fs (%d%%)' % (t, 100*(t-t0)/(simtime+rsttime)), end='')
+
+    # Let neurons and synapses rest before the next stimuli 
+    reset_input_frequencies(neurons)
+    while t < t0+simtime+rsttime:
+        spikes = update(dt, t, neurons, connections)
+        e1_count += spikes.count(I_e1)
+        e2_count += spikes.count(I_e2)
+        t += dt
+        print('\r t = %fs (%d%%)' % (t, 100*(t-t0)/(simtime+rsttime)), end='')
+
+    # Refresh the plots
+    clear_output()
+    print('\nStimuli:')
+    plot_digit(plt,stimuli)
+    plt.show()
+    print('Excitatory cell e1 spike count: %d, and weight distribution after %d seconds:' % (e1_count,t))
+    plot_neuron_weights(e1)
+    print('Excitatory cell e2 spike count: %d, and weight distribution after %d seconds:' % (e2_count,t))
+    plot_neuron_weights(e2)
+    plt.show()
